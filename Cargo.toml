@@ -1,0 +1,3 @@
+[workspace]
+members = ["mixins/openysm/engine"]
+resolver = "2"

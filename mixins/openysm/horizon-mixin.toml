@@ -1,0 +1,73 @@
+[[injection]]
+id = "model-texture"
+kind = "HEAD"
+target = "horizon_client_render::hud::HudAtlas::slots"
+helper = "texture.rs"
+bindings = [{ name = "images", ty = "&mut Vec<(String, u32, u32, Vec<u8>)>", value = "&mut *images" }]
+
+[[injection]]
+id = "model-command"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::commands::Game<'_>::run_command"
+helper = "command.rs"
+bindings = [{ name = "command", ty = "&str", value = "command" }]
+
+[[injection]]
+id = "first-person-arm"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::Game<'_>::first_person_arm"
+helper = "arm.rs"
+bindings = [
+ { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+ { name = "left", ty = "bool", value = "left" },
+ { name = "matrix", ty = "glam::Mat4", value = "m" },
+ { name = "light", ty = "u32", value = "light" },
+ { name = "out", ty = "&mut Vec<horizon_client::mesher::Vertex>", value = "&mut *out" },
+]
+
+[[injection]]
+id = "cloud-player-update"
+kind = "HEAD"
+target = "horizon_client::game::remote::Game<'_>::update_remote_skins"
+helper = "cloud_tick.rs"
+bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" }]
+
+[mod]
+id = "openysm"
+version = "0.1.0"
+priority = 100
+
+[compatibility]
+horizon_revision = "ba6344a59cb9e755b730dcf02285fc0d33b97d3c"
+
+[[crate]]
+id = "engine"
+path = "engine"
+dependent = "horizon-client"
+
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/mobs/render.rs"
+name = "openysm"
+source = "runtime.rs"
+visibility = "pub"
+
+[[injection]]
+id = "player-body"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::mobs::render::render_visible"
+helper = "render.rs"
+bindings = [
+ { name = "m", ty = "&crate::mobs::Mob", value = "m" },
+ { name = "alpha", ty = "f32", value = "alpha" },
+ { name = "base", ty = "glam::Mat4", value = "base" },
+ { name = "atlas", ty = "crate::mobs::render::Atlas<'_>", value = "atlas" },
+ { name = "light", ty = "u32", value = "light" },
+ { name = "data", ty = "&crate::mobs::MobData", value = "data" },
+ { name = "extra", ty = "&[(&crate::mobs::Part, [f32; 4], u32, u32)]", value = "extra" },
+ { name = "body_visible", ty = "bool", value = "body_visible" },
+ { name = "out", ty = "&mut Vec<crate::mesher::Vertex>", value = "&mut *out" },
+]

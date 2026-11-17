@@ -17,6 +17,12 @@ def run(command, **kwargs):
     command = [str(x) for x in command]
     if command[0] == 'cargo':
         command.insert(1, '+1.95.0')
+    # Keep compiler scratch files separate from ambient TEMP (MSVC /Z7 also
+    # writes command-line debug records here). No system environment is changed.
+    if os.name == 'nt' and 'env' not in kwargs:
+        scratch = ROOT / 'target' / 'compiler-temp'
+        scratch.mkdir(parents=True, exist_ok=True)
+        kwargs['env'] = dict(os.environ, TEMP=str(scratch), TMP=str(scratch))
     return subprocess.run(command, check=True, **kwargs)
 
 

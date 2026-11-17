@@ -1,0 +1,163 @@
+{
+ "format_version": "1.8.0",
+ "animations": {
+  "idle": {
+   "loop": true,
+   "animation_length": 2,
+   "blend_weight": "v.w ?? 1",
+   "bones": {
+    "Head": {
+     "rotation": {
+      "0.0": [
+       0,
+       0,
+       0
+      ],
+      "1.0": {
+       "pre": [
+        5,
+        "math.sin(q.anim_time*90)*3",
+        0
+       ],
+       "post": [
+        10,
+        0,
+        0
+       ]
+      },
+      "2.0": [
+       0,
+       0,
+       0
+      ]
+     },
+     "position": [
+      0,
+      "math.cos(q.anim_time*180)",
+      0
+     ]
+    },
+    "Tail": {
+     "rotation": {
+      "0.0": {
+       "post": [
+        0,
+        0,
+        0
+       ],
+       "lerp_mode": "catmullrom"
+      },
+      "0.5": {
+       "post": [
+        0,
+        20,
+        0
+       ],
+       "lerp_mode": "catmullrom"
+      },
+      "1.5": {
+       "post": [
+        0,
+        -20,
+        0
+       ],
+       "lerp_mode": "catmullrom"
+      },
+      "2.0": {
+       "post": [
+        0,
+        0,
+        0
+       ],
+       "lerp_mode": "catmullrom"
+      }
+     },
+     "scale": 1.5
+    }
+   },
+   "timeline": {
+    "0.5": "v.t = 1;",
+    "1.0": [
+     "v.t = 2;",
+     "v.u = 3;"
+    ]
+   },
+   "sound_effects": {
+    "0.25": {
+     "effect": "step"
+    }
+   }
+  },
+  "walk": {
+   "loop": "hold_on_last_frame",
+   "animation_length": 1,
+   "bones": {
+    "LeftArm": {
+     "rotation": {
+      "0.0": [
+       -30,
+       0,
+       0
+      ],
+      "0.5": [
+       30,
+       0,
+       0
+      ],
+      "1.0": [
+       -30,
+       0,
+       0
+      ]
+     }
+    },
+    "RightArm": {
+     "rotation": {
+      "0.0": [
+       30,
+       0,
+       0
+      ],
+      "0.5": [
+       -30,
+       0,
+       0
+      ],
+      "1.0": [
+       30,
+       0,
+       0
+      ]
+     }
+    }
+   }
+  },
+  "jump": {
+   "bones": {
+    "Body": {
+     "position": [
+      0,
+      "q.life_time",
+      0
+     ]
+    }
+   }
+  },
+  "parallel0": {
+   "loop": true,
+   "bones": {
+    "Tail": {
+     "rotation": [
+      "ysm.second_order('t', q.ground_speed, 2, 0.5, 0)",
+      0,
+      0
+     ]
+    }
+   }
+  },
+  "empty": {
+   "loop": false,
+   "animation_length": 0.5
+  }
+ }
+}

@@ -11,7 +11,18 @@ kind = "HEAD"
 cancellable = true
 target = "horizon_client::game::commands::Game<'_>::run_command"
 helper = "command.rs"
-bindings = [{ name = "command", ty = "&str", value = "command" }]
+bindings = [
+ { name = "command", ty = "&str", value = "command" },
+ { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+]
+
+[[injection]]
+id = "client-command"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::remote::Game<'_>::send_chat"
+helper = "chat.rs"
+bindings = [{ name = "message", ty = "&str", value = "message" }]
 
 [[injection]]
 id = "first-person-arm"
@@ -32,6 +43,13 @@ id = "cloud-player-update"
 kind = "HEAD"
 target = "horizon_client::game::remote::Game<'_>::update_remote_skins"
 helper = "cloud_tick.rs"
+bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" }]
+
+[[injection]]
+id = "pack-update"
+kind = "HEAD"
+target = "horizon_client::game::perspective::Game<'_>::tick_player_model"
+helper = "pack_tick.rs"
 bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" }]
 
 [[injection]]

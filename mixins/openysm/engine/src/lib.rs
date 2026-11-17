@@ -1,5 +1,12 @@
 //! OpenYSM geometry and animation runtime, independent of Minecraft Java and Horizon.
+pub mod bundle;
 pub mod molang;
+pub mod package;
+#[cfg(test)]
+mod package_tests;
+pub mod resources;
+pub mod ysm;
+pub mod ysm_binary;
 use serde_json::Value;
 use std::{ffi::c_void, ptr::NonNull};
 
@@ -276,7 +283,10 @@ pub struct ClipSet {
 }
 impl ClipSet {
     pub fn load(bytes: &[u8]) -> Result<Self, String> {
-        let doc = parse_json(bytes)?;
+        Self::from_document(&parse_json(bytes)?)
+    }
+    /// The clips of a parsed Bedrock animation document.
+    pub fn from_document(doc: &Value) -> Result<Self, String> {
         let animations = doc["animations"].as_object().ok_or("missing animations")?;
         if animations.len() > 4096 {
             return Err("too many animations".into());
@@ -303,6 +313,22 @@ impl ClipSet {
     }
     pub fn get(&self, name: &str) -> Option<&Clip> {
         self.clips.get(name)
+    }
+    /// Removes a loaded clip, for a caller that plays it on its own.
+    pub fn take(&mut self, name: &str) -> Option<Clip> {
+        self.clips.remove(name)
+    }
+    /// OpenYSM's `pre_parallel0..7` (played before the main state) or
+    /// `parallel0..7` (after it) clips that are loaded and animate a bone.
+    pub fn parallel(&self, pre: bool) -> impl Iterator<Item = &Clip> {
+        (0..8).filter_map(move |slot| {
+            let name = if pre { format!("pre_parallel{slot}") } else { format!("parallel{slot}") };
+            self.clips.get(&name).filter(|clip| !clip.is_empty())
+        })
+    }
+    /// How many channel expressions of loaded clips evaluate as 0 because they are malformed.
+    pub fn ignored(&self) -> usize {
+        self.clips.values().map(|clip| clip.ignored.len()).sum()
     }
     /// The first matching state that has a loaded clip: (name, plays once, clip).
     /// OpenYSM always takes the first matching state; skipping one without a
@@ -399,9 +425,14 @@ pub fn load_geometry(input: &[u8]) -> Result<Model, String> {
                 glow: b["glow"].as_bool().unwrap_or(false),
                 quads: Vec::new(),
             };
+            // A bone's inflate and mirror are the defaults of its cubes.
+            let inflate = b["inflate"].as_f64().unwrap_or(0.) as f32;
+            let mirror = b["mirror"].as_bool().unwrap_or(false);
             if let Some(cubes) = b["cubes"].as_array() {
                 for cube in cubes {
-                    bake_cube(cube, tw, th, &mut bone.quads)?;
+                    if cube.is_object() {
+                        bake_cube(cube, inflate, mirror, tw, th, &mut bone.quads)?;
+                    }
                 }
             }
             ordered.push(bone);
@@ -413,110 +444,161 @@ pub fn load_geometry(input: &[u8]) -> Result<Model, String> {
     }
     Model::new(ordered)
 }
-fn rotate(p: [f32; 3], pivot: [f32; 3], r: [f32; 3]) -> [f32; 3] {
-    let [mut x, mut y, mut z] = std::array::from_fn(|i| p[i] - pivot[i]);
-    let (s, c) = r[0].to_radians().sin_cos();
-    (y, z) = (y * c - z * s, y * s + z * c);
-    let (s, c) = r[1].to_radians().sin_cos();
-    (x, z) = (x * c + z * s, -x * s + z * c);
-    let (s, c) = r[2].to_radians().sin_cos();
-    (x, y) = (x * c - y * s, x * s + y * c);
-    [x + pivot[0], y + pivot[1], z + pivot[2]]
-}
-fn bake_cube(c: &Value, tw: f32, th: f32, out: &mut Vec<Quad>) -> Result<(), String> {
+/// One cube as OpenYSM's `YSMFolderDeserializer.bakeFaceToRaw` bakes it: in
+/// blocks, X mirrored, faces in its order (north, south, east, west, up, down).
+/// A cube without `uv` has no faces; a face-UV cube only those it names.
+fn bake_cube(c: &Value, bone_inflate: f32, bone_mirror: bool, tw: f32, th: f32, out: &mut Vec<Quad>) -> Result<(), String> {
     let origin = vec3(&c["origin"], [0.; 3])?;
     let size = vec3(&c["size"], [0.; 3])?;
-    let pivot = vec3(&c["pivot"], [0.; 3])?;
-    let rotation = vec3(&c["rotation"], [0.; 3])?;
-    let inflate = c["inflate"].as_f64().unwrap_or(0.) as f32;
-    let lo: [f32; 3] = std::array::from_fn(|i| origin[i] - inflate);
-    let hi: [f32; 3] = std::array::from_fn(|i| origin[i] + size[i] + inflate);
-    let points: [[f32; 3]; 8] = std::array::from_fn(|i| {
-        let p = std::array::from_fn(|axis| {
-            if i & (1 << axis) == 0 {
-                lo[axis]
-            } else {
-                hi[axis]
-            }
-        });
-        let p = rotate(p, pivot, rotation);
-        [-p[0] / 16., p[1] / 16., p[2] / 16.]
-    });
-    let [w, h, d] = size;
-    let (u, v) = if let Some(a) = c["uv"].as_array() {
-        (
-            a.first().and_then(Value::as_f64).unwrap_or(0.) as f32,
-            a.get(1).and_then(Value::as_f64).unwrap_or(0.) as f32,
-        )
+    let inflate = c["inflate"].as_f64().map_or(bone_inflate, |v| v as f32);
+    let mirror = c["mirror"].as_bool().unwrap_or(bone_mirror);
+    let low = [-origin[0] - size[0] - inflate, origin[1] - inflate, origin[2] - inflate];
+    let lo = low.map(|v| v / 16.);
+    let hi: [f32; 3] = std::array::from_fn(|i| (low[i] + (size[i] + inflate * 2.)) / 16.);
+    // Corner i: bit 2 picks the high X, bit 1 the high Y, bit 0 the high Z.
+    let corner = |i: usize| [if i & 4 == 0 { lo[0] } else { hi[0] }, if i & 2 == 0 { lo[1] } else { hi[1] }, if i & 1 == 0 { lo[2] } else { hi[2] }];
+    // The cube's own rotation about its pivot: X, then Y, then Z, in the mirrored space.
+    let turn = if c.get("rotation").is_some() || c.get("pivot").is_some() {
+        let pivot = vec3(&c["pivot"], [0.; 3])?;
+        let rotation = vec3(&c["rotation"], [0.; 3])?;
+        Some(([-pivot[0] / 16., pivot[1] / 16., pivot[2] / 16.], [-rotation[0].to_radians(), -rotation[1].to_radians(), rotation[2].to_radians()]))
     } else {
-        (0., 0.)
+        None
     };
-    let faces = [
-        ("west", [0, 4, 6, 2], [u, v + d, d, h]),
-        ("east", [5, 1, 3, 7], [u + d + w, v + d, d, h]),
-        ("down", [0, 1, 5, 4], [u + d + w, v, w, d]),
-        ("up", [6, 7, 3, 2], [u + d, v, w, d]),
-        ("north", [1, 0, 2, 3], [u + d, v + d, w, h]),
-        ("south", [4, 5, 7, 6], [u + 2. * d + w, v + d, w, h]),
-    ];
-    for (name, indices, box_uv) in faces {
-        let rect = if c["uv"].is_object() {
-            let f = &c["uv"][name];
-            if f.is_null() {
-                continue;
-            }
-            let a = f["uv"].as_array().ok_or("missing face uv")?;
-            let s = f["uv_size"].as_array().ok_or("missing face uv_size")?;
-            if a.len() != 2 || s.len() != 2 {
-                return Err("invalid face uv".into());
-            }
-            [
-                a[0].as_f64().ok_or("invalid uv")? as f32,
-                a[1].as_f64().ok_or("invalid uv")? as f32,
-                s[0].as_f64().ok_or("invalid uv")? as f32,
-                s[1].as_f64().ok_or("invalid uv")? as f32,
-            ]
-        } else {
-            box_uv
-        };
-        let p = indices.map(|i| points[i]);
-        let a: [f32; 3] = std::array::from_fn(|i| p[1][i] - p[0][i]);
-        let b: [f32; 3] = std::array::from_fn(|i| p[2][i] - p[0][i]);
-        let n = [
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
-        ];
-        let length = n.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
-        let [u, v, w, h] = rect;
-        let mut uv = [
-            [(u + w) / tw, (v + h) / th],
-            [u / tw, (v + h) / th],
-            [u / tw, v / th],
-            [(u + w) / tw, v / th],
-        ];
-        if c["mirror"].as_bool().unwrap_or(false) {
-            uv.swap(0, 1);
-            uv.swap(2, 3);
+    let rotated = |[mut x, mut y, mut z]: [f32; 3], angles: [f32; 3]| {
+        let (s, c) = angles[0].sin_cos();
+        (y, z) = (y * c - z * s, y * s + z * c);
+        let (s, c) = angles[1].sin_cos();
+        (x, z) = (x * c + z * s, -x * s + z * c);
+        let (s, c) = angles[2].sin_cos();
+        (x, y) = (x * c - y * s, x * s + y * c);
+        [x, y, z]
+    };
+    let (dx, dy, dz) = (size[0].floor(), size[1].floor(), size[2].floor());
+    let number = |v: &Value| v.as_f64().map(|v| v as f32).ok_or("invalid uv");
+    let pair = |v: &Value| -> Result<[f32; 2], String> {
+        match v.as_array() {
+            None if v.is_null() => Ok([0.; 2]),
+            Some(a) if a.len() == 2 => Ok([number(&a[0])?, number(&a[1])?]),
+            _ => Err("invalid face uv".into()),
         }
+    };
+    let box_uv = if c["uv"].is_array() { Some(pair(&c["uv"])?) } else { None };
+    let faces: [(&str, &str, [usize; 4], [f32; 3]); 6] = [
+        ("north", "north", [2, 6, 4, 0], [0., 0., -1.]),
+        ("south", "south", [7, 3, 1, 5], [0., 0., 1.]),
+        ("east", "west", [6, 7, 5, 4], [1., 0., 0.]),
+        ("west", "east", [3, 2, 0, 1], [-1., 0., 0.]),
+        ("up", "up", [3, 7, 6, 2], [0., 1., 0.]),
+        ("down", "down", [0, 4, 5, 1], [0., -1., 0.]),
+    ];
+    for (face, mirrored, corners, normal) in faces {
+        // A mirrored cube takes the east face's texture from west and the reverse.
+        let name = if mirror { mirrored } else { face };
+        let (uv, uv_size) = if let Some([u, v]) = box_uv {
+            match name {
+                "north" => ([u + dz, v + dz], [dx, dy]),
+                "south" => ([u + dz + dx + dz, v + dz], [dx, dy]),
+                "east" => ([u, v + dz], [dz, dy]),
+                "west" => ([u + dz + dx, v + dz], [dz, dy]),
+                "up" => ([u + dz, v], [dx, dz]),
+                _ => ([u + dz + dx, v + dz], [dx, -dz]),
+            }
+        } else if let Some(entry) = c["uv"].get(name) {
+            (pair(&entry["uv"])?, pair(&entry["uv_size"])?)
+        } else {
+            continue;
+        };
+        let (mut u0, v0, mut u1, v1) = (uv[0] / tw, uv[1] / th, (uv[0] + uv_size[0]) / tw, (uv[1] + uv_size[1]) / th);
+        if !mirror {
+            std::mem::swap(&mut u0, &mut u1);
+        }
+        let texture = [[u0, v0], [u1, v0], [u1, v1], [u0, v1]];
+        let mut positions = corners.map(corner);
+        let mut normal = normal;
+        if let Some((pivot, angles)) = turn {
+            for position in &mut positions {
+                let moved = rotated(std::array::from_fn(|i| position[i] - pivot[i]), angles);
+                *position = std::array::from_fn(|i| moved[i] + pivot[i]);
+            }
+            normal = rotated(normal, angles);
+            let length = normal.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
+            normal = normal.map(|x| x / length);
+        }
+        // The renderer takes a face wound the other way, with the normal pointing in.
         out.push(Quad {
-            positions: p,
-            uv,
-            normal: n.map(|x| x / length),
+            positions: std::array::from_fn(|i| positions[3 - i]),
+            uv: std::array::from_fn(|i| texture[3 - i]),
+            normal: normal.map(|x| -x),
         });
     }
     Ok(())
 }
-
-/// Numeric Bedrock animation tracks; unsupported Molang fails explicitly.
+/// Mutable state belongs to an entity instance, never to shared clip assets.
+#[derive(Default)]
+pub struct Animator {
+    pub variables: molang::Variables,
+    /// What the layers of the current frame wrote, per bone.
+    channels: Vec<Channels>,
+}
+/// Per bone: rotation in degrees, position in pixels and scale, where a layer wrote one.
+type Channels = [Option<[f32; 3]>; 3];
+impl Animator {
+    pub fn reset(&mut self) {
+        self.variables.clear();
+    }
+    /// Call once per evaluated frame, before `apply`, with the entity's render
+    /// time in ticks: `ysm.second_order`/`ysm.first_order` values integrate here.
+    pub fn advance(&mut self, render_ticks: f32) {
+        self.variables.advance(render_ticks);
+    }
+    pub fn apply(
+        &mut self,
+        clip: &Clip,
+        model: &mut Model,
+        time: f32,
+        looping: bool,
+        query: &impl Fn(&str) -> f32,
+    ) {
+        self.begin();
+        self.layer(clip, model, time, looping, false, query);
+        self.finish(model);
+    }
+    /// Starts a frame of layered clips: `begin`, `layer` in controller order, `finish`.
+    pub fn begin(&mut self) {
+        self.channels.clear();
+    }
+    /// Samples one clip over the layers before it, as OpenYSM's controllers do
+    /// once their transition has ended: a channel the clip animates replaces
+    /// the bone's value. With `add_rotation` (its `parallel` controllers) the
+    /// rotation is added to the bone's current one instead.
+    pub fn layer(
+        &mut self,
+        clip: &Clip,
+        model: &Model,
+        time: f32,
+        looping: bool,
+        add_rotation: bool,
+        query: &impl Fn(&str) -> f32,
+    ) {
+        clip.sample(model, time, looping, query, &self.variables, add_rotation, &mut self.channels);
+    }
+    /// Poses the model from the frame's layers; a channel no layer wrote rests.
+    pub fn finish(&mut self, model: &mut Model) {
+        pose_channels(model, &self.channels);
+    }
+}
+/// Immutable Bedrock animation tracks; unsupported Molang fails explicitly.
 pub struct Clip {
     pub length: f32,
     pub looping: bool,
     unbounded_time: bool,
     tracks: Value,
     expressions: std::collections::HashMap<String, molang::Expr>,
-    /// What this clip's expressions assigned; kept between frames.
-    variables: molang::Variables,
+    /// `blend_weight`: scales what the clip writes; evaluated once per sample.
+    blend_weight: Option<molang::Expr>,
+    /// Channel text that is not Molang for OpenYSM either; it evaluates as 0 there and here.
+    pub ignored: Vec<String>,
 }
 impl Clip {
     pub fn load(bytes: &[u8], name: &str) -> Result<Self, String> {
@@ -536,18 +618,30 @@ impl Clip {
             _ => return Err("animation bones must be an object".into()),
         };
         let mut expressions = std::collections::HashMap::new();
+        let mut ignored = Vec::new();
         fn compile(
             v: &Value,
             expressions: &mut std::collections::HashMap<String, molang::Expr>,
+            ignored: &mut Vec<String>,
         ) -> Result<Value, String> {
             Ok(match v {
                 Value::String(s) => {
-                    expressions.insert(s.clone(), molang::Expr::parse(s)?);
+                    if !expressions.contains_key(s) {
+                        let expression = match molang::Expr::parse_checked(s) {
+                            Ok(expression) => expression,
+                            Err(error) if error.malformed => {
+                                ignored.push(s.clone());
+                                molang::Expr::Number(0.)
+                            }
+                            Err(error) => return Err(error.message),
+                        };
+                        expressions.insert(s.clone(), expression);
+                    }
                     Value::from(0)
                 }
                 Value::Array(a) => Value::Array(
                     a.iter()
-                        .map(|v| compile(v, expressions))
+                        .map(|v| compile(v, expressions, ignored))
                         .collect::<Result<_, _>>()?,
                 ),
                 Value::Object(o) => Value::Object(
@@ -558,7 +652,7 @@ impl Clip {
                                 if k == "lerp_mode" {
                                     v.clone()
                                 } else {
-                                    compile(v, expressions)?
+                                    compile(v, expressions, ignored)?
                                 },
                             ))
                         })
@@ -567,7 +661,20 @@ impl Clip {
                 _ => v.clone(),
             })
         }
-        let validated = compile(&tracks, &mut expressions)?;
+        let validated = compile(&tracks, &mut expressions, &mut ignored)?;
+        let blend_weight = match &a["blend_weight"] {
+            Value::Null => None,
+            Value::Number(n) => Some(molang::Expr::Number(n.as_f64().unwrap_or(1.) as f32)),
+            Value::String(s) => Some(match molang::Expr::parse_checked(s) {
+                Ok(expression) => expression,
+                Err(error) if error.malformed => {
+                    ignored.push(s.clone());
+                    molang::Expr::Number(0.)
+                }
+                Err(error) => return Err(error.message),
+            }),
+            _ => return Err("invalid blend_weight".into()),
+        };
         let mut inferred_length = 0.0_f32;
         for b in validated
             .as_object()
@@ -619,7 +726,8 @@ impl Clip {
             unbounded_time: a.get("animation_length").is_none() && inferred_length == 0. && !expressions.is_empty(),
             tracks,
             expressions,
-            variables: Default::default(),
+            blend_weight,
+            ignored,
         })
     }
     pub fn apply(&self, model: &mut Model, time: f32) {
@@ -631,10 +739,40 @@ impl Clip {
     /// Like `apply_with_queries`, with the loop mode chosen by the caller: an
     /// OpenYSM state names its own, whatever the clip's `loop` says.
     pub fn apply_as(&self, model: &mut Model, time: f32, looping: bool, query: &impl Fn(&str) -> f32) {
+        self.apply_as_with_variables(model, time, looping, query, &molang::Variables::default());
+    }
+    /// Sample shared animation assets using the caller's entity-local variable scope.
+    pub fn apply_as_with_variables(
+        &self,
+        model: &mut Model,
+        time: f32,
+        looping: bool,
+        query: &impl Fn(&str) -> f32,
+        variables: &molang::Variables,
+    ) {
+        let mut channels = Vec::new();
+        self.sample(model, time, looping, query, variables, false, &mut channels);
+        pose_channels(model, &channels);
+    }
+    /// Whether the clip animates no bone.
+    pub fn is_empty(&self) -> bool {
+        self.tracks.as_object().is_none_or(|bones| bones.is_empty())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn sample(
+        &self,
+        model: &Model,
+        time: f32,
+        looping: bool,
+        query: &impl Fn(&str) -> f32,
+        variables: &molang::Variables,
+        add_rotation: bool,
+        channels: &mut Vec<Channels>,
+    ) {
         let time = if time.is_finite() { time.max(0.) } else { 0. };
         let time = if self.unbounded_time {
             time
-        } else if looping && self.length > 0. {
+        } else if looping && self.length > 0. && time > self.length {
             time.rem_euclid(self.length)
         } else {
             time.min(self.length)
@@ -667,23 +805,43 @@ impl Clip {
                 _ => v.clone(),
             }
         }
-        // Every expression of the clip runs each frame, keyframes at other times
-        // included, in sorted bone/channel/key order. An assignment is therefore
-        // seen by later expressions of this frame and by all of the next frame.
-        let tracks = evaluate(&self.tracks, &self.expressions, &query, &self.variables);
-        model.pose(|bone| {
-            let b = &tracks[&bone.name];
-            let mut r = track(&b["rotation"], time, [0.; 3]);
-            r[0] = -r[0];
-            r[1] = -r[1];
-            (
-                std::array::from_fn(|i| bone.rotation[i] + r[i].to_radians()),
-                track(&b["position"], time, [0.; 3]),
-                track(&b["scale"], time, [1.; 3]),
-                false,
-            )
-        });
+        let evaluate_selected = |v: &Value| evaluate(v, &self.expressions, &query, variables);
+        let weight = self.blend_weight.as_ref().map_or(1., |weight| weight.eval_with(&query, variables));
+        channels.resize(model.bones.len(), [None; 3]);
+        for (bone, written) in model.bones.iter().zip(channels.iter_mut()) {
+            let b = &self.tracks[&bone.name];
+            if !b["rotation"].is_null() {
+                let r = track_evaluated(&b["rotation"], time, [0.; 3], &evaluate_selected).map(|v| v * weight);
+                written[0] = Some(match written[0] {
+                    Some(current) if add_rotation => std::array::from_fn(|i| current[i] + r[i]),
+                    _ => r,
+                });
+            }
+            if !b["position"].is_null() {
+                written[1] = Some(track_evaluated(&b["position"], time, [0.; 3], &evaluate_selected).map(|v| v * weight));
+            }
+            if !b["scale"].is_null() {
+                // OpenYSM weighs a scale towards 1, not towards 0.
+                written[2] = Some(track_evaluated(&b["scale"], time, [1.; 3], &evaluate_selected).map(|v| 1. + (v - 1.) * weight));
+            }
+        }
     }
+}
+fn pose_channels(model: &mut Model, channels: &[Channels]) {
+    let mut index = 0;
+    model.pose(|bone| {
+        let written = channels.get(index).copied().unwrap_or([None; 3]);
+        index += 1;
+        let mut r = written[0].unwrap_or([0.; 3]);
+        r[0] = -r[0];
+        r[1] = -r[1];
+        (
+            std::array::from_fn(|i| bone.rotation[i] + r[i].to_radians()),
+            written[1].unwrap_or([0.; 3]),
+            written[2].unwrap_or([1.; 3]),
+            false,
+        )
+    });
 }
 fn frame_vector(v: &Value) -> Result<[f32; 3], String> {
     if let Some(value) = v.as_f64() {
@@ -701,15 +859,24 @@ fn frame(v: &Value) -> Result<[f32; 3], String> {
     }
     frame_vector(if v.is_object() { &v["post"] } else { v })
 }
+#[cfg(test)]
 fn track(v: &Value, time: f32, default: [f32; 3]) -> [f32; 3] {
+    track_evaluated(v, time, default, &Value::clone)
+}
+fn track_evaluated(
+    v: &Value,
+    time: f32,
+    default: [f32; 3],
+    evaluate: &impl Fn(&Value) -> Value,
+) -> [f32; 3] {
     if v.is_null() {
         return default;
     }
     if let Some(n) = v.as_f64() {
         return [n as f32; 3];
     }
-    if v.is_array() {
-        return vec3(v, default).unwrap_or(default);
+    if v.is_array() || v.is_string() {
+        return frame_vector(&evaluate(v)).unwrap_or(default);
     }
     let mut keys: Vec<(f32, &Value)> = v
         .as_object()
@@ -721,10 +888,12 @@ fn track(v: &Value, time: f32, default: [f32; 3]) -> [f32; 3] {
     let Some(first) = keys.first() else {
         return default;
     };
-    let post = |v: &Value| frame(v).unwrap_or(default);
+    let post = |v: &Value| frame_vector(&evaluate(v.get("post").unwrap_or(v))).unwrap_or(default);
     let pre = |v: &Value| {
-        v.get("pre")
-            .map_or_else(|| post(v), |p| frame_vector(p).unwrap_or(default))
+        v.get("pre").map_or_else(
+            || post(v),
+            |p| frame_vector(&evaluate(p)).unwrap_or(default),
+        )
     };
     if time < first.0 {
         return pre(first.1);
@@ -732,10 +901,18 @@ fn track(v: &Value, time: f32, default: [f32; 3]) -> [f32; 3] {
     for (index, w) in keys.windows(2).enumerate() {
         if time < w[1].0 {
             let t = ((time - w[0].0) / (w[1].0 - w[0].0)).clamp(0., 1.);
-            let p1 = post(w[0].1);
-            let p2 = pre(w[1].1);
-            if w[1].1["lerp_mode"].as_str() == Some("catmullrom") {
+            if t < 0.00001 {
+                return post(w[0].1);
+            }
+            if t > 0.99999 {
+                return post(w[1].1);
+            }
+            if w[1].1["lerp_mode"].as_str() == Some("catmullrom")
+                || w[0].1["lerp_mode"].as_str() == Some("catmullrom")
+            {
                 let p0 = post(keys[index.saturating_sub(1)].1);
+                let p1 = post(w[0].1);
+                let p2 = pre(w[1].1);
                 let p3 = pre(keys[(index + 2).min(keys.len() - 1)].1);
                 return std::array::from_fn(|i| {
                     0.5 * ((2. * p1[i])
@@ -744,6 +921,9 @@ fn track(v: &Value, time: f32, default: [f32; 3]) -> [f32; 3] {
                         + (-p0[i] + 3. * p1[i] - 3. * p2[i] + p3[i]) * t * t * t)
                 });
             }
+            // Upstream linear evaluation reads the destination before the source.
+            let p2 = pre(w[1].1);
+            let p1 = post(w[0].1);
             return std::array::from_fn(|i| p1[i] + t * (p2[i] - p1[i]));
         }
     }
@@ -778,6 +958,86 @@ mod tests {
         let a = Clip::load(br#"{"animations":{"walk":{"animation_length":1,"loop":true,"bones":{"root":{"position":{"0":[0,0,0],"1":[16,0,0]}}}}}}"#,"walk").unwrap();
         a.apply(&mut m, 0.5);
         assert!((m.render(&IDENTITY, 0, 0)[0].position[0] + 0.5).abs() < 0.001);
+        a.apply(&mut m, 1.);
+        assert!((m.render(&IDENTITY, 0, 0)[0].position[0] + 1.).abs() < 0.001);
+        a.apply(&mut m, 1.25);
+        assert!((m.render(&IDENTITY, 0, 0)[0].position[0] + 0.25).abs() < 0.001);
+    }
+    #[test]
+    fn malformed_channels_read_zero_and_unsupported_molang_rejects_the_clip() {
+        let set = ClipSet::load(br#"{"animations":{
+            "stray":{"animation_length":1,"bones":{"root":{"position":["(1+2))+3","4*2",0],"rotation":["(1+2))+3",0,0]}}},
+            "scope":{"bones":{"root":{"position":["{v.x=1;}",0,0]}}},
+            "bone":{"bones":{"root":{"position":["ysm.bone_rot('root')",0,0]}}}}}"#).unwrap();
+        assert_eq!(set.len(), 1);
+        assert_eq!(set.rejected.len(), 2);
+        assert_eq!(set.ignored(), 1);
+        let clip = set.get("stray").unwrap();
+        assert_eq!(clip.ignored, ["(1+2))+3"]);
+        let mut m = model();
+        clip.apply(&mut m, 0.);
+        let moved = m.render(&IDENTITY, 0, 0)[0].position;
+        m.pose(|b| (b.rotation, [0.; 3], [1.; 3], false));
+        let rest = m.render(&IDENTITY, 0, 0)[0].position;
+        // x reads 0 as upstream; y is 8 model units, half a block.
+        assert!((moved[0] - rest[0]).abs() < 1e-5);
+        assert!((moved[1] - rest[1] - 0.5).abs() < 1e-5, "{moved:?} {rest:?}");
+    }
+    #[test]
+    fn layers_override_channels_and_parallel_adds_rotation() {
+        let set = ClipSet::load(br#"{"animations":{
+            "pre_parallel0":{"loop":true,"bones":{"root":{"rotation":[10,0,0],"position":[1,2,3],"scale":2},"child":{"rotation":[0,0,30]}}},
+            "pre_parallel3":{"bones":{}},
+            "idle":{"loop":true,"bones":{"root":{"rotation":[0,20,0]}}},
+            "parallel1":{"bones":{"root":{"rotation":[5,5,5],"position":[7,0,0]}}},
+            "parallel0":{"blend_weight":"v.w ?? 0.5","bones":{"child":{"rotation":[0,0,10],"position":[4,4,4],"scale":[3,3,3]}}},
+            "parallel2":{"blend_weight":"(1))","bones":{"root":{"position":[9,9,9]}}},
+            "parallel9":{"bones":{"root":{"position":[8,8,8]}}},
+            "parallel4":{"blend_weight":"ysm.bone_rot('x')","bones":{"root":{"position":[8,8,8]}}}}}"#).unwrap();
+        // Slot order, without the empty clip, the rejected one and names outside 0..7.
+        assert_eq!(set.parallel(true).count(), 1);
+        assert_eq!(set.parallel(false).count(), 3);
+        assert_eq!(set.rejected.len(), 1);
+        assert_eq!(set.ignored(), 1);
+        let mut m = model();
+        let mut animator = Animator::default();
+        let absent = |_: &str| f32::NAN;
+        let frame = |animator: &mut Animator, m: &mut Model, add: bool| {
+            animator.begin();
+            for clip in set.parallel(true) {
+                animator.layer(clip, m, 0., true, false, &absent);
+            }
+            animator.layer(set.get("idle").unwrap(), m, 0., true, false, &absent);
+            for clip in set.parallel(false) {
+                animator.layer(clip, m, 0., true, add, &absent);
+            }
+            animator.finish(m);
+            m.animation.clone()
+        };
+        let close = |actual: &[f32], expected: [f32; 3]| {
+            assert!(actual.iter().zip(expected).all(|(a, e)| (a - e).abs() < 1e-5), "{actual:?} {expected:?}");
+        };
+        let pose = frame(&mut animator, &mut m, true);
+        // root: idle replaces the pre layer's rotation, parallel1 adds to it;
+        // x and y are negated on the way to the renderer.
+        close(&pose[0..3], [(-5f32).to_radians(), (-25f32).to_radians(), 5f32.to_radians()]);
+        // A malformed weight is 0: parallel2 writes a zero position over parallel1's.
+        close(&pose[3..6], [0.; 3]);
+        close(&pose[6..9], [2.; 3]);
+        // child: half of parallel0, added to the pre layer's rotation; scale weighs towards 1.
+        close(&pose[12..15], [0., 0., 35f32.to_radians()]);
+        close(&pose[15..18], [2.; 3]);
+        close(&pose[18..21], [2.; 3]);
+        // Without the parallel mode a later layer replaces the rotation as well.
+        let pose = frame(&mut animator, &mut m, false);
+        close(&pose[0..3], [(-5f32).to_radians(), (-5f32).to_radians(), 5f32.to_radians()]);
+        close(&pose[12..15], [0., 0., 5f32.to_radians()]);
+        // No layer: the rest pose.
+        animator.begin();
+        animator.finish(&mut m);
+        close(&m.animation[0..3], [0.; 3]);
+        close(&m.animation[6..9], [1.; 3]);
+        close(&m.animation[12..15], [0.; 3]);
     }
     #[test]
     fn rejects_cycles_and_invalid_molang() {
@@ -909,112 +1169,62 @@ mod tests {
     #[test]
     fn clip_assignments_drive_channels_and_persist_between_frames() {
         let mut m = model();
-        // `root` assigns from the animation time; `child` reads it. Bones evaluate
-        // in sorted order, so `child` sees the previous frame's value.
+        // Hierarchy order evaluates root before child; the child sees this frame's assignment.
         let clip = Clip::load(br#"{"animations":{"idle":{"animation_length":10,"bones":{
             "root":{"position":["v.bv=query.anim_time*2",0,0]},
             "child":{"position":["v.bv",0,0]}}}}}"#, "idle").unwrap();
-        clip.apply(&mut m, 1.);
+        let mut animator = Animator::default();
+        animator.apply(&clip, &mut m, 1., false, &|_| 0.);
         assert_eq!(m.animation[3], 2.);
-        assert_eq!(m.animation[12 + 3], 0.);
-        clip.apply(&mut m, 3.);
-        assert_eq!(m.animation[3], 6.);
         assert_eq!(m.animation[12 + 3], 2.);
+        animator.apply(&clip, &mut m, 3., false, &|_| 0.);
+        assert_eq!(m.animation[3], 6.);
+        assert_eq!(m.animation[12 + 3], 6.);
         // A separately loaded clip has its own scope.
         let other = Clip::load(br#"{"animations":{"a":{"bones":{"root":{"position":["v.bv",0,0]}}}}}"#, "a").unwrap();
         other.apply(&mut m, 0.);
         assert_eq!(m.animation[3], 0.);
     }
     #[test]
+    fn only_sampled_keyframes_execute_in_upstream_order() {
+        let clip = Clip::load(br#"{"animations":{"a":{"bones":{"root":{"position":{"0":["v.x=v.x+1",0,0],"1":["v.x=v.x*10+2",0,0],"2":["v.x=999",0,0]}}}}}}"#, "a").unwrap();
+        let mut m = model();
+        let mut animator = Animator::default();
+        animator.apply(&clip, &mut m, 0.5, false, &|_| 0.);
+        assert_eq!(m.animation[3], 2.5);
+        assert_eq!(animator.variables.number("variable.x"), Some(3.));
+        animator.reset();
+        animator.apply(&clip, &mut m, 0., false, &|_| 0.);
+        assert_eq!(m.animation[3], 1.);
+        assert_eq!(animator.variables.number("variable.x"), Some(1.));
+    }
+    #[test]
+    fn shared_clip_instances_do_not_leak_variables() {
+        fn assert_shared<T: Send + Sync>() {}
+        assert_shared::<Clip>();
+        assert_shared::<ClipSet>();
+        let clip = Clip::load(
+            br#"{"animations":{"a":{"bones":{"root":{"position":["v.x=v.x+1",0,0]}}}}}"#,
+            "a",
+        )
+        .unwrap();
+        let mut m = model();
+        let mut first = Animator::default();
+        let mut second = Animator::default();
+        first.apply(&clip, &mut m, 0., false, &|_| 0.);
+        assert_eq!(m.animation[3], 1.);
+        second.apply(&clip, &mut m, 0., false, &|_| 0.);
+        assert_eq!(m.animation[3], 1.);
+        first.apply(&clip, &mut m, 1., false, &|_| 0.);
+        assert_eq!(m.animation[3], 2.);
+        second.reset();
+        second.apply(&clip, &mut m, 1., false, &|_| 0.);
+        assert_eq!(m.animation[3], 1.);
+        clip.apply(&mut m, 0.);
+        assert_eq!(m.animation[3], 1.);
+        clip.apply(&mut m, 0.);
+        assert_eq!(m.animation[3], 1.);
+    }
+    #[test]
     fn states_follow_openysm_priority_order() {
         let names = |s: PlayerState| s.states().into_iter().map(|x| x.0).collect::<Vec<_>>();
-        let ground = PlayerState { on_ground: true, ..Default::default() };
-        assert_eq!(names(ground), ["idle"]);
-        assert_eq!(names(PlayerState { limb_swing: 0.2, ..ground }), ["walk", "idle"]);
-        // Exactly at the threshold is not walking; walk does not take the absolute value.
-        assert_eq!(names(PlayerState { limb_swing: 0.05, ..ground }), ["idle"]);
-        assert_eq!(names(PlayerState { limb_swing: -0.2, ..ground }), ["idle"]);
-        assert_eq!(names(PlayerState { limb_swing: 0.2, sprinting: true, ..ground }), ["run", "walk", "idle"]);
-        assert_eq!(names(PlayerState { limb_swing: -0.2, crouching: true, ..ground }),
-                   ["sneak", "sneaking", "idle"]);
-        assert_eq!(names(PlayerState { crouching: true, sprinting: true, ..ground }),
-                   ["sneaking", "run", "idle"]);
-        assert_eq!(names(PlayerState::default()), ["jump", "idle"]);
-        assert_eq!(names(PlayerState { in_water: true, ..Default::default() }), ["swim_stand", "idle"]);
-        assert_eq!(names(PlayerState { in_water: true, swimming: true, swim_pose: true, limb_swing: 0.3, ..Default::default() }),
-                   ["swim", "climb", "climbing", "swim_stand", "idle"]);
-        assert_eq!(names(PlayerState { swim_pose: true, ..ground }), ["climbing", "idle"]);
-        assert_eq!(names(PlayerState { on_ladder: true, vertical_speed: 2., ..Default::default() }),
-                   ["ladder_up", "jump", "idle"]);
-        assert_eq!(names(PlayerState { on_ladder: true, ..Default::default() })[0], "ladder_stillness");
-        assert_eq!(names(PlayerState { on_ladder: true, vertical_speed: -1., ..Default::default() })[0], "ladder_down");
-        assert_eq!(names(PlayerState { flying: true, fall_flying: true, ..Default::default() }),
-                   ["fly", "elytra_fly", "jump", "idle"]);
-        // Death outranks everything; hurt sits between swim_stand and jump.
-        let hurt = PlayerState { hurt: true, limb_swing: 0.2, ..ground };
-        assert_eq!(hurt.states(), [("attacked", true), ("walk", false), ("idle", false)]);
-        assert_eq!(PlayerState { dead: true, sleeping: true, ..hurt }.states()[..2], [("death", true), ("sleep", false)]);
-        assert!(PlayerState { riding: true, dead: true, ..ground }.states().is_empty());
-    }
-    #[test]
-    fn clip_set_selects_by_state_and_skips_unusable_clips() {
-        // UTF-8 byte order mark, as some packs ship it.
-        let mut bytes = b"\xef\xbb\xbf".to_vec();
-        bytes.extend_from_slice(br#"{"animations":{
-            "idle":{"loop":true,"animation_length":2,"bones":{"root":{"position":{"0":[0,0,0],"2":[2,0,0]}}}},
-            "walk":{"animation_length":1,"bones":{"root":{"position":[5,0,0]}}},
-            "death":{"loop":true,"animation_length":1,"bones":{"root":{"position":{"0":[0,0,0],"1":[8,0,0]}}}},
-            "run":{"bones":{"root":{"position":["ysm.second_order('k', 1, 1, 1, 0)",0,0]}}}}}"#);
-        let set = ClipSet::load(&bytes).unwrap();
-        assert_eq!(set.len(), 3);
-        assert_eq!(set.rejected.len(), 1);
-        assert_eq!(set.rejected[0].0, "run");
-        assert!(set.get("idle").is_some() && set.get("run").is_none());
-        let ground = PlayerState { on_ground: true, ..Default::default() };
-        assert_eq!(set.select(&ground).unwrap().0, "idle");
-        assert_eq!(set.select(&PlayerState { limb_swing: 0.3, ..ground }).unwrap().0, "walk");
-        // `run` matches first but was rejected, so the next matching state plays.
-        assert_eq!(set.select(&PlayerState { limb_swing: 0.3, sprinting: true, ..ground }).unwrap().0, "walk");
-        // No jump clip: the airborne player falls back to idle.
-        assert_eq!(set.select(&PlayerState::default()).unwrap().0, "idle");
-        assert!(set.select(&PlayerState { riding: true, ..ground }).is_none());
-        // The state's loop mode overrides the clip's: death holds its last frame
-        // although the file says loop, and idle wraps.
-        let mut m = model();
-        let (name, once, clip) = set.select(&PlayerState { dead: true, ..ground }).unwrap();
-        assert_eq!((name, once), ("death", true));
-        clip.apply_as(&mut m, 5.5, !once, &|_| 0.);
-        assert_eq!(m.animation[3], 8.);
-        clip.apply_as(&mut m, 5.5, true, &|_| 0.);
-        assert_eq!(m.animation[3], 4.);
-        set.get("idle").unwrap().apply_as(&mut m, 2.5, true, &|_| 0.);
-        assert_eq!(m.animation[3], 0.5);
-        assert!(ClipSet::load(br#"{"animations":[]}"#).is_err());
-        assert!(ClipSet::load(b"{}").is_err());
-        assert!(ClipSet::load(br#"{"animations":{}}"#).unwrap().is_empty());
-        // The mark is accepted by the other loaders too.
-        let mut geometry = b"\xef\xbb\xbf".to_vec();
-        geometry.extend_from_slice(br#"{"minecraft:geometry":[{"bones":[{"name":"a"}]}]}"#);
-        assert!(load_geometry(&geometry).is_ok());
-        assert!(Clip::load(&bytes, "walk").is_ok());
-    }
-    #[test]
-    fn scalar_keyframes_interpolate_all_axes() {
-        let data = serde_json::json!({"0":1,"1":{"pre":3,"post":5},"2":7});
-        assert_eq!(track(&data, 0.5, [0.;3]), [2.;3]);
-        assert_eq!(track(&data, 1., [0.;3]), [5.;3]);
-        assert_eq!(track(&data, 1.5, [0.;3]), [6.;3]);
-        let clip = Clip::load(br#"{"animations":{"a":{"bones":{"root":{"scale":{"0":1,"1":{"pre":2,"post":3}}}}}}}"#, "a").unwrap();
-        let mut m = model();
-        clip.apply(&mut m, 0.5);
-        assert_eq!(&m.animation[6..9], &[1.5;3]);
-        assert!(frame_vector(&serde_json::json!(1e100)).is_err());
-        assert!(vec3(&serde_json::json!([1e100,0,0]), [0.;3]).is_err());
-        assert!(Clip::load(br#"{"animations":{"a":{"bones":{"root":{"scale":1e100}}}}}"#, "a").is_err());
-    }
-    #[test]
-    fn gpu_layout_matches_upstream() {
-        assert_eq!(std::mem::size_of::<BoneData>(), 144);
-        assert_eq!(std::mem::size_of::<Vertex>(), 40);
-    }
-}

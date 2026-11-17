@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from launch import pack_environment
+from launch import native_environment, pack_environment
 
 
 class PackSelectionTests(unittest.TestCase):
@@ -69,6 +69,26 @@ class PackSelectionTests(unittest.TestCase):
                 manifest.write_text(json.dumps(doc))
                 with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                     pack_environment(root)
+
+    def test_native_environment_names_the_pack_and_sizes_the_slot(self):
+        def png(width, height):
+            return b'\x89PNG\r\n\x1a\n' + (13).to_bytes(4, 'big') + b'IHDR' + width.to_bytes(4, 'big') + height.to_bytes(4, 'big')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'skin.png').write_bytes(png(256, 512))
+            self.assertEqual(native_environment(root), {'OPENYSM_PACK': str(root.resolve())})
+            env = native_environment(root, 'skin', 'wave')
+            self.assertEqual((env['OPENYSM_PACK_TEXTURE'], env['OPENYSM_CLIP']), ('skin', 'wave'))
+            (root / 'large.png').write_bytes(png(64, 1025))
+            self.assertEqual(native_environment(root)['OPENYSM_PACK_SLOT'], '2048')
+            (root / 'huge.png').write_bytes(png(2049, 8))
+            with self.assertRaisesRegex(ValueError, '2048'):
+                native_environment(root)
+            archive = root / 'pack.zip'
+            archive.write_bytes(b'PK')
+            self.assertEqual(native_environment(archive), {'OPENYSM_PACK': str(archive.resolve())})
+            with self.assertRaisesRegex(ValueError, 'not found'):
+                native_environment(root / 'missing')
 
     def test_selection_and_path_validation(self):
         with tempfile.TemporaryDirectory() as directory:

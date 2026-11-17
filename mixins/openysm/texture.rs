@@ -4,6 +4,12 @@ fn texture(images: &mut Vec<(String, u32, u32, Vec<u8>)>) {
             images.push((format!("openysm/cloud{i}"),512,512,vec![0;512*512*4]));
         }
     }
+    // One square slot the runtime writes the selected pack texture into.
+    let slot = std::env::var("OPENYSM_PACK_SLOT").ok().and_then(|size|size.parse::<u32>().ok());
+    if std::env::var_os("OPENYSM_PACK").is_some() || slot.is_some() {
+        let size = slot.unwrap_or(1024).clamp(16,2048);
+        images.push(("openysm/pack".into(),size,size,vec![0;size as usize*size as usize*4]));
+    }
     let Some(path) = std::env::var_os("OPENYSM_TEXTURE_FILE") else { return; };
     let result = (|| -> std::result::Result<(u32,u32,Vec<u8>),String> {
         let path = std::path::Path::new(&path);

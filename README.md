@@ -13,7 +13,7 @@
 - Molang 子集：算术、比较、逻辑、三元表达式及 sin/cos/asin/acos/atan/atan2/abs/sqrt/floor/ceil/round/trunc/exp/ln/mod/min/max/pow/clamp/lerp/lerp_rotate；反三角函数返回角度，lerp_rotate 沿最短角差插值；查询支持 anim_time、life_time、ground_speed、is_moving、is_alive。支持 variable.* / v.* 只读变量，Cloud roaming 可使用带 variable. 前缀或不带前缀的键（带前缀优先），不会覆盖 query.*。尚未接入的查询返回 0，未知函数报错。OpenYSM 的二元条件 `a ? b`（条件为假时取 0）可用。`ysm.*` 与 `ctrl.*` 绑定保留各自命名空间，目前只接入 `ysm.head_yaw`（头相对身体的偏航，限幅 85°，取负）和 `ysm.head_pitch`（取负），其余读作 0；`??`、字符串字面量（含 `ysm.second_order`）、`math.random` 仍会让整个片段加载失败。
 - 变量赋值与多语句：`v.x = 值` 得到所赋的值并写入该片段自己的变量表（上限 256 个），`a; b; return c` 按顺序执行，结果取最后一条或 `return` 的值。变量表跟随已加载的片段，换片段即清空；同名时片段内赋的值优先于 Cloud roaming。与上游有两处差别：每帧会执行片段里的全部表达式（包括不在当前时间的关键帧），顺序是骨骼、通道、关键帧的键名排序而非文件顺序，所以同一帧内先读后写的变量拿到的是上一帧的值；只能给 `variable.*` 赋值，且赋值必须出现在整条表达式可以开始的位置。内置包里 540 处赋值有 15 处写在关键帧内，会受“全部执行”的影响。
 - 没有 `bones` 的片段（如 `hold_mainhand:empty`）按静止姿态加载，不再报错。
-- `cargo run --example validate_animations -- <动画文件...>` 统计片段加载情况及拒绝原因。对仓库旁 OpenYSM 内置的 27 个模型包：3349 个片段中 3162 个可加载，187 个被拒绝（多为字符串字面量、`math.random` 和 `??`）；默认包 `arm.animation.json` 的 57 个片段全部可加载，`main.animation.json` 的 50 个中 45 个可加载（含 idle、walk、run、jump、sneak）。能加载不代表会播放：片段仍需通过 `OPENYSM_CLIP` 或 Cloud 动作逐个选择。
+- `cargo run --example validate_animations -- <动画文件...>` 统计片段加载情况及拒绝原因。`cargo run --example validate_package -- <模型包目录或zip...>` 读取整个模型包、列出被拒绝的片段并分层驱动主模型 60 帧。对仓库旁 OpenYSM 内置的 27 个模型包，清单引用的动画里还有 19 个片段被拒绝（缺 `ysm.bone_rot`、`query.position` 等绑定），默认包没有被拒绝的片段。能加载不代表表现与 OpenYSM 一致，当前进度见 [MIGRATION.md](MIGRATION.md)。
 - `OPENYSM_TEXTURE_FILE` 加载 PNG 并注册到 Horizon 图集，尺寸上限 4096×4096、文件上限 32 MiB；首次构建图集时加载，尚无纹理热更新。
 - 拦截 Horizon 玩家实体的 body 绘制，保留 Horizon 的护甲及其他 entity layers。模型未配置、加载失败或纹理不存在时回退原模型。
 - CPU SIMD 蒙皮输出 Horizon 实体顶点，由现有 wgpu 管线绘制。C++ 保留原始 32 字节 GPU 顶点和 144 字节骨骼布局。
@@ -57,7 +57,9 @@ python tools/launch.py --pack ../OpenYSM/common/src/main/resources/assets/yes_st
 
 工具解析 `ysm.json` 中的主模型、纹理列表及默认纹理，限制资源路径必须位于模型包内。不会自动播放完整 OpenYSM 状态机。
 
-本地命令处理路径提供 `/openysm off`、`/openysm reload`、`/openysm model <geometry路径>`。后者仅切换几何，继续使用当前图集纹理并清除旧动画；加载失败保留旧模型。消息目前写入终端。多人服务器聊天路径尚未验证，不声明支持服务器侧命令。
+加 `--native` 时工具只把模型包路径交给客户端（`OPENYSM_PACK`，目录或 ZIP 均可），由客户端自己读取清单、主模型、手臂、主动画和纹理；`--texture`、`--clip` 对应 `OPENYSM_PACK_TEXTURE`、`OPENYSM_CLIP`。包纹理写入启动时预留的一块图集槽，默认 1024 px，`OPENYSM_PACK_SLOT` 可设为 16 到 2048；纹理大于槽时不显示并在终端报错。
+
+聊天栏命令由客户端自己处理，不发给服务器：`/openysm off`、`/openysm reload`、`/openysm list`、`/openysm model <geometry路径>`、`/openysm pack <目录或zip>`、`/openysm texture <名称>`。`model` 仅切换几何，继续使用当前图集纹理并清除旧动画。`pack` 在后台线程读取模型包，完成后整体替换模型、手臂、动画和纹理；`texture` 在当前包的纹理间切换；两者要求启动时设置了 `OPENYSM_PACK` 或 `OPENYSM_PACK_SLOT`。加载失败保留旧模型。消息目前写入终端，游戏内没有提示。经 `horizon-ctl command` 或服务器控制台发出的 `/openysm` 不会生效，因为它们直接在服务器线程执行。
 
 第一人称手臂有两种来源，都使用当前模型纹理，未配置或加载失败时保留 Horizon 原手臂：
 

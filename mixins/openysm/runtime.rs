@@ -89,7 +89,7 @@ pub fn cloud_update(directory: &std::path::Path, players: std::collections::BTre
                 let patch=crate::font::Patch{x:(rect.u0*atlas.width as f32).round() as u32,
                     y:(rect.v0*atlas.height as f32).round() as u32,width:w,height:h,rgba:pixels};
                 atlas.sprites.insert(texture.clone(),rect);
-                Ok((Loaded{model,clip,clips,playing:Default::default(),
+                Ok((Loaded{model,clip,clips,playing:Default::default(),animators:Default::default(),
                             motion:row["motion"].as_object().map(|_|row["motion"].clone()),
                             display_state:row["display_state"].as_object().map(|_|row["display_state"].clone()),
                             texture},patch))
@@ -110,6 +110,7 @@ struct Loaded {
     clips: Option<openysm_runtime::ClipSet>,
     /// Per mob: the state now playing and the age (seconds) it started at.
     playing: std::collections::HashMap<u32,(&'static str,f32)>,
+    animators: std::collections::HashMap<u32,(f32,openysm_runtime::Animator)>,
     motion: Option<serde_json::Value>,
     display_state: Option<serde_json::Value>,
     texture: String,
@@ -128,6 +129,19 @@ pub struct LocalPlayer {
     pub dead: bool,
     pub vertical_speed: f32,
 }
+/// Retire state when players leave or an entity id belongs to a different UUID.
+pub fn sync_players(players: &std::collections::BTreeMap<u32,String>) {
+    PLAYER_IDENTITIES.with(|identities| {
+        let mut identities = identities.borrow_mut();
+        MODEL.with(|slot| {
+            if let Some(model) = slot.borrow_mut().as_mut() {
+                model.animators.retain(|id,_| players.contains_key(id) && identities.get(id) == players.get(id));
+                model.playing.retain(|id,_| players.contains_key(id) && identities.get(id) == players.get(id));
+            }
+        });
+        *identities = players.clone();
+    });
+}
 pub fn local_player(state: Option<LocalPlayer>) {
     LOCAL.with(|local| local.set(state));
 }
@@ -141,6 +155,9 @@ fn load_clips(path: &std::path::Path) -> Option<openysm_runtime::ClipSet> {
             if !set.rejected.is_empty() {
                 eprintln!("[openysm] {} animation clips loaded, {} unsupported (first: {} - {})",
                           set.len(),set.rejected.len(),set.rejected[0].0,set.rejected[0].1);
+            }
+            if set.ignored() > 0 {
+                eprintln!("[openysm] {} malformed animation expressions read as 0, as in OpenYSM",set.ignored());
             }
             Some(set)
         },
@@ -192,6 +209,8 @@ thread_local! {
     static LOCAL: std::cell::Cell<Option<LocalPlayer>> = const { std::cell::Cell::new(None) };
     static CLOUD: RefCell<CloudState> = RefCell::new(CloudState::default());
     static MODEL: RefCell<Option<Loaded>> = RefCell::new(load());
+    static PLAYER_IDENTITIES: RefCell<std::collections::BTreeMap<u32,String>> = RefCell::new(Default::default());
+    static PACK: RefCell<PackState> = RefCell::new(PackState::default());
     // Index 0 is the right arm. The mask selects one part group of a shared model.
     static ARMS: RefCell<[Option<(openysm_runtime::Model,u32)>;2]> = RefCell::new([
         load_arm("OPENYSM_RIGHT_ARM",2), load_arm("OPENYSM_LEFT_ARM",1)
@@ -254,13 +273,218 @@ pub fn render_arm(left: bool, matrix: glam::Mat4, atlas: crate::mobs::render::At
         })
     })
 }
+/// The atlas slot `texture.rs` reserves for a pack's texture.
+const PACK_SLOT: &str = "openysm/pack";
+/// Present only while the slot holds the selected texture. The body and arms
+/// draw with it, so a rebuilt atlas keeps Horizon's own player until the upload.
+const PACK_LIVE: &str = "openysm/pack_live";
+struct PackTexture { width: u32, height: u32, rgba: Vec<u8> }
+type BuiltPack = (Loaded,[Option<(openysm_runtime::Model,u32)>;2],Option<PackTexture>,openysm_runtime::bundle::ModelBundle);
+/// A model pack read by the engine: a directory or a ZIP with `ysm.json`.
+#[derive(Default)]
+struct PackState {
+    path: Option<std::path::PathBuf>,
+    /// The selected texture's file stem; None is the manifest's default.
+    wanted_texture: Option<String>,
+    clip: Option<String>,
+    /// What is left of the pack after the model took its main animations.
+    bundle: Option<openysm_runtime::bundle::ModelBundle>,
+    texture: Option<PackTexture>,
+    /// The slot must be written again.
+    dirty: bool,
+    service: Option<openysm_runtime::resources::ResourceService>,
+    /// The background load in flight: generation, path, texture, clip.
+    pending: Option<(u64,std::path::PathBuf,Option<String>,Option<String>)>,
+    warned: bool,
+}
+fn decode_pack_texture(bytes: &[u8]) -> Result<PackTexture,String> {
+    // Bound dimensions before decode allocates the RGBA image.
+    if bytes.len() > 32*1024*1024 {return Err("texture file exceeds 32 MiB".into());}
+    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
+        return Err("expected PNG IHDR".into());
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+    let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+    if width == 0 || height == 0 || width > 4096 || height > 4096 {
+        return Err("texture dimensions must be within 1..4096".into());
+    }
+    let (width,height,rgba) = crate::hud::decode_bytes(bytes).map_err(|e|e.to_string())?;
+    if rgba.len() != width as usize*height as usize*4 {return Err("texture pixel count mismatch".into());}
+    Ok(PackTexture{width,height,rgba})
+}
+/// Body, arms and texture of a pack. `clip` pins one clip; without it the
+/// pack's main animations follow the player's state.
+fn build_pack(mut bundle: openysm_runtime::bundle::ModelBundle, texture: Option<&str>, clip: Option<&str>) -> Result<BuiltPack,String> {
+    let model = bundle.model()?;
+    let mut arms = [None,None];
+    for (slot,part) in [(0,2),(1,1)] {
+        arms[slot] = bundle.arm()?.filter(|arm|arm.has_part(part)).map(|arm|(arm,part));
+    }
+    let pixels = match bundle.texture_index(texture)? {
+        Some(index) => Some(decode_pack_texture(bundle.texture(index)?)?),
+        None => None,
+    };
+    let (clip,clips) = match clip {
+        Some(name) => {
+            let role = bundle.find_clip(name)?.ok_or_else(||format!("clip {name} is not in the pack"))?.0.to_owned();
+            (bundle.animations.get_mut(&role).and_then(|set|set.take(name)),None)
+        },
+        None => (None,bundle.animations.remove("main")),
+    };
+    if let Some(first) = bundle.diagnostics.first() {
+        eprintln!("[openysm] {} animation clips unsupported (first: {first})",bundle.diagnostics.len());
+    }
+    let ignored: usize = clips.iter().map(|set|set.ignored()).sum();
+    if ignored > 0 {
+        eprintln!("[openysm] {ignored} malformed animation expressions read as 0, as in OpenYSM");
+    }
+    let texture = if pixels.is_some() {PACK_LIVE} else {"entity/player/wide/steve"}.to_owned();
+    Ok((Loaded{model,clip,clips,playing:Default::default(),animators:Default::default(),motion:None,display_state:None,texture},arms,pixels,bundle))
+}
+/// Starts reading a pack on the resource worker; `pack_update` installs it.
+fn request_pack(path: std::path::PathBuf, texture: Option<String>, clip: Option<String>) -> bool {
+    // The startup pack loads with the model slot, before this state is borrowed.
+    MODEL.with(|_|{});
+    PACK.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.service.is_none() {
+            match openysm_runtime::resources::ResourceService::new(Default::default()) {
+                Ok(service) => state.service = Some(service),
+                Err(error) => {eprintln!("[openysm] resource worker: {error}");return false;}
+            }
+        }
+        let generation = state.service.as_ref().unwrap().request(path.clone());
+        state.pending = Some((generation,path,texture,clip));
+        true
+    })
+}
+fn select_pack_texture(name: &str) -> bool {
+    MODEL.with(|_|{});
+    PACK.with(|state| {
+        let mut state = state.borrow_mut();
+        let state = &mut *state;
+        let Some(bundle) = state.bundle.as_ref() else {
+            eprintln!("[openysm] no pack is loaded");
+            return false;
+        };
+        let pixels = bundle.texture_index(Some(name))
+            .and_then(|index|bundle.texture(index.unwrap_or(0)))
+            .and_then(decode_pack_texture);
+        match pixels {
+            Ok(pixels) => {
+                state.texture = Some(pixels);
+                state.wanted_texture = Some(name.to_owned());
+                state.dirty = true;
+                true
+            },
+            Err(error) => {eprintln!("[openysm] texture change failed: {error}");false}
+        }
+    })
+}
+/// Installs a pack the worker finished and writes the selected texture into
+/// its atlas slot. Called every tick; the returned patches go to the GPU atlas.
+pub fn pack_update(atlas: &mut crate::hud::HudAtlas) -> Vec<crate::font::Patch> {
+    MODEL.with(|_|{});
+    PACK.with(|state| {
+        let mut state = state.borrow_mut();
+        let state = &mut *state;
+        let done = state.service.as_ref().and_then(|service|service.try_recv());
+        if let Some(done) = done {
+            if state.pending.as_ref().is_some_and(|pending|pending.0 == done.generation) {
+                let (_,path,texture,clip) = state.pending.take().unwrap();
+                let built = done.result
+                    .and_then(|bundle|std::sync::Arc::try_unwrap(bundle).map_err(|_|"pack is still in use".to_string()))
+                    .and_then(|bundle|build_pack(bundle,texture.as_deref(),clip.as_deref()));
+                match built {
+                    Ok((loaded,arms,pixels,bundle)) => {
+                        MODEL.with(|slot| *slot.borrow_mut() = Some(loaded));
+                        ARMS.with(|slot| *slot.borrow_mut() = arms);
+                        eprintln!("[openysm] pack loaded: {}",path.display());
+                        state.path = Some(path);
+                        state.wanted_texture = texture;
+                        state.clip = clip;
+                        state.texture = pixels;
+                        state.bundle = Some(bundle);
+                        state.dirty = true;
+                    },
+                    // The model in use stays.
+                    Err(error) => eprintln!("[openysm] pack rejected: {error}"),
+                }
+            }
+        }
+        if state.dirty {
+            atlas.sprites.remove(PACK_LIVE);
+            state.dirty = false;
+        }
+        if atlas.sprites.contains_key(PACK_LIVE) {return Vec::new();}
+        let Some(texture) = state.texture.as_ref() else {return Vec::new();};
+        let Some(slot) = atlas.sprites.get(PACK_SLOT).copied() else {
+            if !state.warned {
+                eprintln!("[openysm] no pack texture slot: start with OPENYSM_PACK or OPENYSM_PACK_SLOT set");
+                state.warned = true;
+            }
+            return Vec::new();
+        };
+        if texture.width > slot.w || texture.height > slot.h {
+            eprintln!("[openysm] pack texture {}x{} exceeds the {}x{} slot; raise OPENYSM_PACK_SLOT",
+                      texture.width,texture.height,slot.w,slot.h);
+            state.texture = None;
+            return Vec::new();
+        }
+        let mut rect = slot;
+        rect.u1 = rect.u0+texture.width as f32/atlas.width as f32;
+        rect.v1 = rect.v0+texture.height as f32/atlas.height as f32;
+        rect.w = texture.width;
+        rect.h = texture.height;
+        atlas.sprites.insert(PACK_LIVE.into(),rect);
+        eprintln!("[openysm] pack texture {}x{} uploaded",texture.width,texture.height);
+        vec![crate::font::Patch{x:(slot.u0*atlas.width as f32).round() as u32,
+            y:(slot.v0*atlas.height as f32).round() as u32,
+            width:texture.width,height:texture.height,rgba:texture.rgba.clone()}]
+    })
+}
 pub fn command(command: &str) -> bool {
+    if let Some(path) = command.strip_prefix("pack ") {
+        return request_pack(std::path::PathBuf::from(path.trim()),None,None);
+    }
+    if let Some(name) = command.strip_prefix("texture ") {
+        return select_pack_texture(name.trim());
+    }
+    MODEL.with(|_|{});
+    let current = PACK.with(|state| {
+        let mut state = state.borrow_mut();
+        match command {
+            "off" => {
+                if let Some(service) = state.service.as_ref() {service.cancel();}
+                state.pending = None;
+                state.path = None;
+                state.bundle = None;
+                state.texture = None;
+                state.dirty = true;
+                None
+            },
+            "reload" => state.path.clone().map(|path|(path,state.wanted_texture.clone(),state.clip.clone())),
+            "list" => {
+                if let (Some(path),Some(bundle)) = (state.path.as_ref(),state.bundle.as_ref()) {
+                    eprintln!("[openysm] pack {}; textures: {}",path.display(),bundle.textures().join(", "));
+                }
+                None
+            },
+            _ => None,
+        }
+    });
+    if let Some((path,texture,clip)) = current {
+        return request_pack(path,texture,clip);
+    }
     MODEL.with(|slot| {
         let mut slot = slot.borrow_mut();
         match command {
-            "off" => { *slot = None; true },
+            "off" => { *slot = None; ARMS.with(|arms| *arms.borrow_mut() = [None,None]); true },
             "reload" => {
-                if let Some(loaded) = load() { *slot = Some(loaded); true } else { false }
+                if let Some(loaded) = load() {
+                    ARMS.with(|arms| *arms.borrow_mut() = [load_arm("OPENYSM_RIGHT_ARM",2),load_arm("OPENYSM_LEFT_ARM",1)]);
+                    *slot = Some(loaded); true
+                } else { false }
             },
             "list" => {
                 eprintln!("[openysm] active model: {}", slot.as_ref().map_or("off", |_| "loaded"));
@@ -286,18 +510,43 @@ pub fn command(command: &str) -> bool {
                         .and_then(|bytes|openysm_runtime::load_geometry(&bytes));
                     match result {
                         Ok(model) => {
+                            ARMS.with(|arms| *arms.borrow_mut() = [None,None]);
                             let texture = slot.as_ref().map(|m|m.texture.clone()).unwrap_or_else(||
                                 if std::env::var_os("OPENYSM_TEXTURE_FILE").is_some() {"openysm/model".into()} else {"entity/player/wide/steve".into()});
-                            *slot = Some(Loaded {model,clip:None,clips:None,playing:Default::default(),motion:None,display_state:None,texture}); true
+                            *slot = Some(Loaded {model,clip:None,clips:None,playing:Default::default(),animators:Default::default(),motion:None,display_state:None,texture}); true
                         },
                         Err(error) => {eprintln!("[openysm] model change failed: {error}");false}
                     }
-                } else {eprintln!("[openysm] commands: off, reload, list, cloud off, cloud on, model <geometry path>");false}
+                } else {eprintln!("[openysm] commands: off, reload, list, cloud off, cloud on, model <geometry path>, pack <directory or zip>, texture <name>");false}
             }
         }
     })
 }
 fn load() -> Option<Loaded> {
+    if let Some(path) = std::env::var_os("OPENYSM_PACK") {
+        // The engine reads the pack; no other OPENYSM_* file variable applies.
+        let path = std::path::PathBuf::from(path);
+        let texture = std::env::var("OPENYSM_PACK_TEXTURE").ok().filter(|name|!name.is_empty());
+        let clip = std::env::var("OPENYSM_CLIP").ok().filter(|name|!name.is_empty());
+        let built = openysm_runtime::bundle::ModelBundle::open(&path,Default::default())
+            .and_then(|bundle|build_pack(bundle,texture.as_deref(),clip.as_deref()));
+        return match built {
+            Ok((loaded,arms,pixels,bundle)) => {
+                ARMS.with(|slot| *slot.borrow_mut() = arms);
+                PACK.with(|state| {
+                    let mut state = state.borrow_mut();
+                    state.path = Some(path);
+                    state.wanted_texture = texture;
+                    state.clip = clip;
+                    state.texture = pixels;
+                    state.bundle = Some(bundle);
+                    state.dirty = true;
+                });
+                Some(loaded)
+            },
+            Err(error) => {eprintln!("[openysm] pack load failed: {error}");None}
+        };
+    }
     let path = std::env::var_os("OPENYSM_MODEL")?;
     let result = (|| -> Result<Loaded,String> {
         let bytes = std::fs::read(path).map_err(|e|e.to_string())?;
@@ -313,7 +562,7 @@ fn load() -> Option<Loaded> {
                 clips = load_clips(std::path::Path::new(&path));
             }
         }
-        Ok(Loaded { model, clip, clips, playing: Default::default(), motion: None, display_state: None, texture: std::env::var("OPENYSM_TEXTURE")
+        Ok(Loaded { model, clip, clips, playing: Default::default(), animators: Default::default(), motion: None, display_state: None, texture: std::env::var("OPENYSM_TEXTURE")
             .unwrap_or_else(|_| if std::env::var_os("OPENYSM_TEXTURE_FILE").is_some() { "openysm/model".into() } else { "entity/player/wide/steve".into() }) })
     })();
     match result {
@@ -348,6 +597,15 @@ fn draw_loaded(loaded: &mut Loaded, m: &crate::mobs::Mob, alpha: f32, base: glam
                atlas: crate::mobs::render::Atlas<'_>, light: u32, out: &mut Vec<crate::mesher::Vertex>) -> bool {
         let Some(uv) = atlas(&loaded.texture) else {return false;};
         let age = (m.age as f32+alpha)/20.;
+        if loaded.animators.len() >= 256 && !loaded.animators.contains_key(&m.id) {
+            return false;
+        }
+        let instance = loaded.animators.entry(m.id).or_default();
+        if age < instance.0 {
+            instance.1.reset();
+            loaded.playing.remove(&m.id);
+        }
+        instance.0 = age;
         let chosen = if let Some(clip) = &loaded.clip {
             let motion_time = loaded.motion.as_ref()
                 .and_then(|motion| motion["started_at_unix_ms"].as_i64())
@@ -365,9 +623,14 @@ fn draw_loaded(loaded: &mut Loaded, m: &crate::mobs::Mob, alpha: f32, base: glam
                 (clip,age-entry.1,!once)
             })
         } else {None};
-        if let Some((clip,time,looping)) = chosen {
+        {
             let speed = ((m.position.x-m.previous.x).powi(2)+(m.position.z-m.previous.z).powi(2)).sqrt() as f32 * 20.;
-            clip.apply_as(&mut loaded.model,time,looping,&|name| {
+            // The local model mob is not moved by the server; its speed is published each tick.
+            let vertical_speed = LOCAL.with(|local| local.get()).filter(|local| local.id == m.id)
+                .map_or(((m.position.y-m.previous.y)*20.) as f32, |local| local.vertical_speed);
+            // Named physics values integrate once per rendered frame, before sampling.
+            instance.1.advance(m.age as f32+alpha);
+            let query = |name: &str| {
                 let motion_value = loaded.motion.as_ref().and_then(|motion| {
                     let key = name.strip_prefix("variable.")?;
                     motion["roaming"].get(name).or_else(|| motion["roaming"].get(key))
@@ -394,6 +657,9 @@ fn draw_loaded(loaded: &mut Loaded, m: &crate::mobs::Mob, alpha: f32, base: glam
                 motion_value.or(display_value).unwrap_or(match name {
                     "life_time" => age,
                     "ground_speed" => speed,
+                    "vertical_speed" => vertical_speed,
+                    // OpenYSM's remote-entity definition; its local player uses a per-frame head delta.
+                    "yaw_speed" => 20.*(m.yaw-m.previous_yaw),
                     "is_moving" => f32::from(speed > 0.01),
                     "is_alive" => f32::from(m.death_time == 0),
                     "ysm.head_yaw" | "ysm.head_pitch" => {
@@ -402,11 +668,26 @@ fn draw_loaded(loaded: &mut Loaded, m: &crate::mobs::Mob, alpha: f32, base: glam
                             (m.previous_head_pitch,m.head_pitch),alpha);
                         if name == "ysm.head_yaw" {yaw} else {pitch}
                     },
+                    // A variable nothing assigned is null: `v.x ?? fallback` takes the fallback.
+                    _ if name.starts_with("variable.") => f32::NAN,
                     _ => 0.,
                 })
-            });
-        } else {
-            loaded.model.pose(|bone|(bone.rotation,[0.;3],[1.;3],false));
+            };
+            // OpenYSM's controller order: the pre_parallel slots, the main state, the parallel slots.
+            // A pinned clip plays alone. Transitions between states are not blended.
+            let parallel = if loaded.clip.is_none() {loaded.clips.as_ref()} else {None};
+            let animator = &mut instance.1;
+            animator.begin();
+            for clip in parallel.into_iter().flat_map(|set| set.parallel(true)) {
+                animator.layer(clip,&loaded.model,age,true,false,&query);
+            }
+            if let Some((clip,time,looping)) = chosen {
+                animator.layer(clip,&loaded.model,time,looping,false,&query);
+            }
+            for clip in parallel.into_iter().flat_map(|set| set.parallel(false)) {
+                animator.layer(clip,&loaded.model,age,true,true,&query);
+            }
+            animator.finish(&mut loaded.model);
         }
         // Horizon's model origin is at the head and its Y axis points down;
         // Bedrock geometry uses feet origin and Y up.

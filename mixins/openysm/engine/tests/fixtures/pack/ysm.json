@@ -1,0 +1,38 @@
+{
+  "spec": 2,
+  "metadata": {
+    "name": "Fixture",
+    "tips": "Generated for openysm-horizon tests",
+    "license": {
+      "type": "CC0"
+    },
+    "authors": [
+      {
+        "name": "openysm-horizon",
+        "role": "fixture"
+      }
+    ]
+  },
+  "properties": {
+    "default_texture": "alt",
+    "height_scale": 0.7,
+    "width_scale": 0.7,
+    "free": true
+  },
+  "files": {
+    "player": {
+      "model": {
+        "main": "models/main.json",
+        "arm": "models/arm.json"
+      },
+      "animation": {
+        "main": "animations/main.animation.json",
+        "arm": "animations/arm.animation.json"
+      },
+      "texture": [
+        "textures/skin.png",
+        "textures/alt.png"
+      ]
+    }
+  }
+}

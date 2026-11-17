@@ -9,6 +9,7 @@ import time
 import uuid
 from launch import pack_environment
 from rgba import decode_png
+from display_state import validate_display
 from spm_cloud import CloudClient, CloudError, atomic_write, extract_pack
 
 REQUEST_MAX_AGE = 5
@@ -51,6 +52,9 @@ def refresh(client, request, root):
             motion = selection.get('motion')
             if motion is not None and not isinstance(motion, dict):
                 raise ValueError('invalid Cloud motion')
+            display_state = validate_display(selection.get('display_state'))
+            if display_state is not None and len(json.dumps(display_state, separators=(',', ':'))) > 64 * 1024:
+                raise ValueError('Cloud display state too large')
             animation_key = motion.get('animation_key', '') if motion else ''
             if not isinstance(animation_key, str) or len(animation_key) > 256:
                 raise ValueError('invalid Cloud animation key')
@@ -75,9 +79,12 @@ def refresh(client, request, root):
                                'animation_path': config.get('OPENYSM_ANIMATION'),
                                'width': width, 'height': height,
                                'motion': motion,
+                               'display_state': display_state,
                                'key': hashlib.sha256(json.dumps(
                                    {'asset': digest, 'texture': selection.get('texture_id', ''),
-                                    'motion': motion}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+                                    'animation': animation_key or None,
+                                    'animation_path': config.get('OPENYSM_ANIMATION')}, 
+                                   sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
         except (ValueError, RuntimeError, OSError, KeyError) as error:
             if isinstance(error, CloudError) and error.status == 401:
                 raise
@@ -92,6 +99,16 @@ def poll_once(client, root, discovered, session):
     request = None
     try:
         request = json.loads(request_path.read_text(encoding='utf-8'))
+        if not isinstance(request, dict):
+            request = None
+            raise ValueError('invalid bridge request')
+        players = request.get('players')
+        if (type(request.get('generation')) is not int or not 0 <= request['generation'] < 2**64
+                or not isinstance(players, dict) or len(players) > 16
+                or any(not key.isascii() or not key.isdecimal() or len(key) > 10
+                       or int(key) > 2**32 - 1 or str(int(key)) != key
+                       or not isinstance(value, str) for key, value in players.items())):
+            raise ValueError('invalid bridge request fields')
         if time.time() - request_path.stat().st_mtime > REQUEST_MAX_AGE:
             raise ValueError('stale game request')
         # Retry once after an expiry, including discovery and asset authorization.

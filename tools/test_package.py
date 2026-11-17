@@ -16,3 +16,22 @@ with zipfile.ZipFile(second) as archive:
         assert path in names, path
     assert not any(name.endswith(('.dll', '.exe', '.so')) for name in names)
 print('reproducible source bundle including C++: OK')
+
+# The native bundle intentionally omits companion tools; the distribution must
+# be independently usable for Cloud launch and source builds.
+first_dist = package(distribution=True)
+digest = hashlib.sha256(first_dist.read_bytes()).digest()
+assert hashlib.sha256(package(distribution=True).read_bytes()).digest() == digest
+with zipfile.ZipFile(first_dist) as archive:
+    names = set(archive.namelist())
+    for path in ['tools/cloud_play.py', 'tools/cloud_watch.py', 'tools/spm_cloud.py',
+                 'tools/display_state.py', 'tools/rgba.py', 'tools/launch.py',
+                 'tools/horizon.py', 'Cargo.toml', 'Cargo.lock', 'compatibility.json',
+                 'LICENSE', 'NOTICE.md', 'SPM_CLOUD.md']:
+        assert path in names, path
+    assert not any(part in ('target', '__pycache__', '.git')
+                   for name in names for part in name.split('/'))
+    for name in names:
+        if name.endswith('.py'):
+            compile(archive.read(name), name, 'exec')
+print('reproducible distribution with Cloud tools and licenses: OK')

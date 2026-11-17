@@ -28,17 +28,28 @@ def pack_environment(pack, texture=None, clip=None):
         raise ValueError(f'unknown texture {texture}; choices: {[Path(n).stem for n in textures]}')
     env = {'OPENYSM_MODEL': resource(player['model']['main']),
            'OPENYSM_TEXTURE_FILE': resource(selected or textures[0])}
+    # Optional first-person arm model; its LeftArm/RightArm bones pick the side.
+    arm = player['model'].get('arm')
+    if arm:
+        env['OPENYSM_ARM'] = resource(arm)
+    animations = player.get('animation') or {}
     if clip:
-        animations = player.get('animation', {})
         matches = []
+        visited = set()
         for name in animations.values():
             path = resource(name)
+            if path in visited:
+                continue
+            visited.add(path)
             content = json.loads(Path(path).read_text(encoding='utf-8-sig'))
             if clip in content.get('animations', {}):
                 matches.append(path)
         if len(matches) != 1:
             raise ValueError(f'clip {clip} must appear in exactly one animation file, found {len(matches)}')
         env.update(OPENYSM_ANIMATION=matches[0], OPENYSM_CLIP=clip)
+    elif animations.get('main'):
+        # No fixed clip: the client picks idle/walk/run... from the main file.
+        env['OPENYSM_ANIMATION'] = resource(animations['main'])
     return env
 
 

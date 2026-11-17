@@ -8,7 +8,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def package():
+def package(*, distribution=False):
     compat = json.loads((ROOT / 'compatibility.json').read_text())
     bundle = ROOT / 'mixins/openysm'
     mod = tomllib.loads((bundle / 'horizon-mixin.toml').read_text())['mod']
@@ -18,7 +18,14 @@ def package():
     for path in sorted(bundle.rglob('*')):
         if path.is_file() and not any(p in ('target', '__pycache__', '.git') for p in path.relative_to(bundle).parts):
             files[path.relative_to(ROOT).as_posix()] = path.read_bytes()
-    output = ROOT / 'target' / f"{mod['id']}-{mod['version']}.hnmod"
+    if distribution:
+        for name in ('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'compatibility.json',
+                     'LICENSE', 'NOTICE.md', 'README.md', 'SPM_CLOUD.md', 'VALIDATION.md'):
+            files[name] = (ROOT / name).read_bytes()
+        for path in sorted((ROOT / 'tools').glob('*.py')):
+            files[path.relative_to(ROOT).as_posix()] = path.read_bytes()
+    suffix = '-source.zip' if distribution else '.hnmod'
+    output = ROOT / 'target' / f"{mod['id']}-{mod['version']}{suffix}"
     output.parent.mkdir(exist_ok=True)
     with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
         for name, content in sorted(files.items()):
@@ -31,4 +38,9 @@ def package():
 
 
 if __name__ == '__main__':
-    package()
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--distribution', action='store_true',
+                        help='include Cloud tools, build configuration, docs and licenses in a source ZIP')
+    args = parser.parse_args()
+    package(distribution=args.distribution)

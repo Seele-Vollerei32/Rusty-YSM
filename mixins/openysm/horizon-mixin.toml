@@ -34,6 +34,13 @@ target = "horizon_client::game::remote::Game<'_>::update_remote_skins"
 helper = "cloud_tick.rs"
 bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" }]
 
+[[injection]]
+id = "local-player-state"
+kind = "HEAD"
+target = "horizon_client::game::perspective::Game<'_>::tick_player_model"
+helper = "local_state.rs"
+bindings = [{ name = "game", ty = "&crate::game::Game<'_>", value = "&*self" }]
+
 [mod]
 id = "openysm"
 version = "0.1.0"

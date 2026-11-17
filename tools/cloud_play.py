@@ -10,11 +10,30 @@ from launch import ROOT
 from spm_cloud import CloudClient
 
 
+def stop_process(process):
+    """Reap owned children even when graceful termination is ignored."""
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--origin', required=True)
     parser.add_argument('--resources', type=Path, required=True)
+    parser.add_argument('--client', type=Path, default=ROOT/'target/horizon-cargo/fast'/
+                        ('horizon-client.exe' if os.name == 'nt' else 'horizon-client'))
     args, extra = parser.parse_known_args()
+    binary = args.client.resolve()
+    if not binary.is_file():
+        parser.error('client executable not found; build it first or pass --client')
+    if not args.resources.is_dir():
+        parser.error('--resources must be an existing prepared resource directory')
     token = os.environ.get('SPM_ACCESS_TOKEN')
     if not token:
         parser.error('SPM_ACCESS_TOKEN is required')
@@ -30,7 +49,6 @@ def main():
         try:
             env = {k: v for k, v in os.environ.items() if not k.startswith(('SPM_', 'OPENYSM_'))}
             env['SPM_BRIDGE_DIR'] = directory
-            binary = ROOT/'target/horizon-cargo/fast'/('horizon-client.exe' if os.name == 'nt' else 'horizon-client')
             game = subprocess.Popen([str(binary), '--resources', str(args.resources.resolve()), *extra], env=env)
             # A worker that dies leaves no Cloud updates; stop rather than show stale models.
             while game.poll() is None:
@@ -41,19 +59,13 @@ def main():
                 time.sleep(0.25)
             return game.returncode
         finally:
-            if game is not None and game.poll() is None:
-                game.terminate()
-                try:
-                    game.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    game.kill()
-                    game.wait()
+            if game is not None:
+                stop_process(game)
             (Path(directory)/'stop').touch()
             try:
                 worker.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                worker.terminate()
-                worker.wait()
+                stop_process(worker)
 
 
 if __name__ == '__main__':

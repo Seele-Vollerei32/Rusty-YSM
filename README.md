@@ -9,8 +9,11 @@
 - 原生 bundle crate，由 horizon-mixins 注入依赖，Rust 和 C++ 一起编译，无 JVM/JNI 依赖。
 - 从 OpenYSM.cpp 复用 SIMD 矩阵、GPU 网格烘焙和骨骼层次计算，添加有长度检查的 C ABI 与 Rust 所有权封装。x86 使用 SSE，ARM64 使用 sse2neon，不强制要求 AVX2/FMA。
 - Bedrock `minecraft:geometry` 首个几何体：骨骼层次、骨骼/立方体 pivot 和 rotation、inflate、box UV、每面 UV、mirror。
-- 动画：旋转、位移、缩放、线性/Catmull-Rom 关键帧、pre/post 跳变、时长推断和循环。
-- Molang 子集：算术、比较、逻辑、三元表达式及 sin/cos/abs/sqrt/floor/ceil/round/min/max/pow/clamp/lerp；查询支持 anim_time、life_time、ground_speed、is_moving、is_alive。尚未接入的查询返回 0，赋值和未知函数报错。
+- 动画：旋转、位移、缩放、线性/Catmull-Rom 关键帧、pre/post 跳变、时长推断和循环。标量关键帧（含 pre/post）展开为三个轴，适用于统一缩放；向量及标量输入拒绝超出 f32 范围的数值。没有显式时长及正时间关键帧的表达式动画持续推进 anim_time，显式时长仍控制截断/循环；负数或非有限时间归零。
+- Molang 子集：算术、比较、逻辑、三元表达式及 sin/cos/asin/acos/atan/atan2/abs/sqrt/floor/ceil/round/trunc/exp/ln/mod/min/max/pow/clamp/lerp/lerp_rotate；反三角函数返回角度，lerp_rotate 沿最短角差插值；查询支持 anim_time、life_time、ground_speed、is_moving、is_alive。支持 variable.* / v.* 只读变量，Cloud roaming 可使用带 variable. 前缀或不带前缀的键（带前缀优先），不会覆盖 query.*。尚未接入的查询返回 0，未知函数报错。OpenYSM 的二元条件 `a ? b`（条件为假时取 0）可用。`ysm.*` 与 `ctrl.*` 绑定保留各自命名空间，目前只接入 `ysm.head_yaw`（头相对身体的偏航，限幅 85°，取负）和 `ysm.head_pitch`（取负），其余读作 0；`??`、字符串字面量（含 `ysm.second_order`）、`math.random` 仍会让整个片段加载失败。
+- 变量赋值与多语句：`v.x = 值` 得到所赋的值并写入该片段自己的变量表（上限 256 个），`a; b; return c` 按顺序执行，结果取最后一条或 `return` 的值。变量表跟随已加载的片段，换片段即清空；同名时片段内赋的值优先于 Cloud roaming。与上游有两处差别：每帧会执行片段里的全部表达式（包括不在当前时间的关键帧），顺序是骨骼、通道、关键帧的键名排序而非文件顺序，所以同一帧内先读后写的变量拿到的是上一帧的值；只能给 `variable.*` 赋值，且赋值必须出现在整条表达式可以开始的位置。内置包里 540 处赋值有 15 处写在关键帧内，会受“全部执行”的影响。
+- 没有 `bones` 的片段（如 `hold_mainhand:empty`）按静止姿态加载，不再报错。
+- `cargo run --example validate_animations -- <动画文件...>` 统计片段加载情况及拒绝原因。对仓库旁 OpenYSM 内置的 27 个模型包：3349 个片段中 3162 个可加载，187 个被拒绝（多为字符串字面量、`math.random` 和 `??`）；默认包 `arm.animation.json` 的 57 个片段全部可加载，`main.animation.json` 的 50 个中 45 个可加载（含 idle、walk、run、jump、sneak）。能加载不代表会播放：片段仍需通过 `OPENYSM_CLIP` 或 Cloud 动作逐个选择。
 - `OPENYSM_TEXTURE_FILE` 加载 PNG 并注册到 Horizon 图集，尺寸上限 4096×4096、文件上限 32 MiB；首次构建图集时加载，尚无纹理热更新。
 - 拦截 Horizon 玩家实体的 body 绘制，保留 Horizon 的护甲及其他 entity layers。模型未配置、加载失败或纹理不存在时回退原模型。
 - CPU SIMD 蒙皮输出 Horizon 实体顶点，由现有 wgpu 管线绘制。C++ 保留原始 32 字节 GPU 顶点和 144 字节骨骼布局。
@@ -56,7 +59,12 @@ python tools/launch.py --pack ../OpenYSM/common/src/main/resources/assets/yes_st
 
 本地命令处理路径提供 `/openysm off`、`/openysm reload`、`/openysm model <geometry路径>`。后者仅切换几何，继续使用当前图集纹理并清除旧动画；加载失败保留旧模型。消息目前写入终端。多人服务器聊天路径尚未验证，不声明支持服务器侧命令。
 
-`OPENYSM_LEFT_ARM` / `OPENYSM_RIGHT_ARM` 可指定独立手臂几何，使用当前模型纹理和 Horizon 手部变换。几何需要围绕手部原点制作；尚未自动解释原版 arm.json 的左右骨骼分组，也未接入手臂动画。未配置时保留原手臂。
+第一人称手臂有两种来源，都使用当前模型纹理，未配置或加载失败时保留 Horizon 原手臂：
+
+- `OPENYSM_ARM`：模型包的 `arm.json`。按 OpenYSM 的骨骼分组选边，`LeftArm`/`RightArm`（区分大小写）及其子骨骼分属左右手，`Background` 两侧都画；几何保持原版肩部坐标，套用上游 `HandItemRenderer` 的手部变换 `translate(±0.25, 1.8, 0) * scale(-1, -1, 1)`。某一侧没有带几何的骨骼时，该侧保留原手臂。`tools/launch.py` 会从 `ysm.json` 的 `files.player.model.arm` 自动设置它。
+- `OPENYSM_LEFT_ARM` / `OPENYSM_RIGHT_ARM`：单侧几何文件，整体绘制，需围绕手部原点制作；设置后优先于 `OPENYSM_ARM`。
+
+手臂动画尚未接入，手臂以静止姿态绘制。上游按手持物品和使用状态从 `arm.animation.json` 选片段（`hold_mainhand:*`、`use_mainhand:*`、`swing:*` 等），这套选择逻辑没有移植；`fp.arm.animation.json` 在 27 个内置包里只有 4 个带骨骼动画。Cloud 模式仍不替换手臂。手臂位置按上游变换实现并有数值测试，但没有在游戏画面中核对过。
 
 ## 选择模型
 
@@ -85,10 +93,19 @@ cargo run --example validate_model -- ../OpenYSM/common/src/main/resources/asset
 
 该默认模型验证结果：64 个骨骼，4128 个顶点，输出坐标和法线均为有限数值。模型资源不包含在本项目源码包中。
 
+## 发行包
+
+`python tools/package.py` 生成只含原生 Mixin 和 C++ crate 的 `.hnmod`。
+Cloud 使用者应运行 `python tools/package.py --distribution`，生成
+`target/openysm-0.1.0-source.zip`。该 ZIP 额外包含 Python 启动/同步工具、测试、
+Cargo 配置、固定版本信息和许可证。解包后按本页构建客户端，再运行 Cloud 启动工具；
+它不包含编译好的客户端、账号凭据、模型资源或 Horizon 上游源码。
+两种包均按固定时间戳和排序写入，可重复生成相同字节。
+
 ## 尚未迁移
 
 - OpenGL GPU skinning/compute shader 尚未转换为 wgpu/WGSL；现有 GPU 缓冲布局不代表已经启用 GPU 蒙皮。
-- 完整 Molang（变量、赋值、自定义查询）、动画状态机/控制器、Bezier、音效/粒子时间线、每玩家模型与动作选择。
+- 完整 Molang（字符串、结构体、`??`、`math.random`、`ysm.second_order` 等有状态函数、大部分 `ysm.*`/`ctrl.*` 绑定）、动画状态机/控制器、Bezier、音效/粒子时间线、每玩家模型与动作选择。
 - `.ysm` 容器、压缩/加密、完整多人实时同步/上传。同步后端改为 **SPM Cloud**，不实现 OpenYSM 原有服务器协议；已有启动时导入及逐玩家轮询、验证下载与动态纹理上传，参见 [SPM_CLOUD.md](SPM_CLOUD.md)。
 - 模型管理界面、轮盘、模型预览选模、完整第一人称手臂动画/骨骼分组及各 Forge/Fabric 兼容模块。
 - 运行时纹理热更新、材质/透明排序和 OpenYSM 专用挂点。仍使用 Horizon 自己的护甲、披风及物品挂点。
